@@ -13,25 +13,35 @@ import math
 import random
 import time
 import re
+import urllib.parse
+import urllib.robotparser
+
+import requests
+
+try:
+    # Author: pablo rotem
+    from bs4 import BeautifulSoup
+except Exception:
+    BeautifulSoup = None
+
+try:
+    # Author: pablo rotem
+    import trafilatura
+except Exception:
+    trafilatura = None
+
+try:
+    # Author: pablo rotem
+    from playwright.sync_api import sync_playwright
+except Exception:
+    sync_playwright = None
 
 
 # ================================================================
-# Pablo Query-Driven Infinite Income Engine
+# Pablo Query-Driven Infinite Income Engine with Live Browser
 # Author: pablo rotem
 # ================================================================
-# גרסה זו משנה את מוקד הלמידה:
-# - במקום ללמוד קודם כול מאנשים, המנוע לומד קודם כול משאלות משתמשים
-# - כל שאלה הופכת לתוכנית מחקר, איסוף ידע, סינתזה, דירוג מסלולי הכנסה,
-#   ושיפור כישורים שמעלים הכנסה אונליין באופן חוקי
-# - המנוע מוגבל רק על ידי חומרה (RAM / CPU / storage / זמן ריצה)
-# - המנוע אינו פוגע בבני אדם, אינו מעליב, אינו מרמה, ואינו מבצע עבירות
-# - בקשות payout נשארות ידניות בלבד
-# ================================================================
 
-
-# ================================================================
-# עוזרים כלליים
-# ================================================================
 
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
@@ -49,9 +59,16 @@ def soft_growth(x: float) -> float:
     return math.log1p(max(0.0, x))
 
 
-# ================================================================
-# מדיניות בטיחות
-# ================================================================
+def normalize_space(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+
+def first_sentences(text: str, max_chars: int = 600) -> str:
+    text = normalize_space(text)
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rsplit(" ", 1)[0].strip() + "..."
+
 
 @dataclass
 class SafetyPolicy:
@@ -62,6 +79,7 @@ class SafetyPolicy:
     never_break_terms: bool = True
     never_pressure_people: bool = True
     always_require_human_approval_for_money_movement: bool = True
+    respect_robots_txt: bool = True
 
     def validate_action(self, action_name: str, tags: Optional[List[str]] = None) -> Tuple[bool, str]:
         tags = tags or []
@@ -86,10 +104,6 @@ class SafetyPolicy:
 
         return True, "מאושר"
 
-
-# ================================================================
-# פרופיל בעלים / יעד עסקי
-# ================================================================
 
 @dataclass
 class OwnerProfile:
@@ -116,10 +130,6 @@ class ObjectiveProfile:
     human_safe_only: bool = True
 
 
-# ================================================================
-# חומרה
-# ================================================================
-
 @dataclass
 class HardwareProfile:
     ram_gb: int = 16
@@ -131,14 +141,11 @@ class HardwareProfile:
         ram_factor = min(2.0, max(0.5, self.ram_gb / 16.0))
         storage_factor = min(1.5, max(0.5, self.storage_gb / 1000.0))
         cpu_factor = 1.0
-        if "i7" in self.cpu_label.lower() or "ryzen 7" in self.cpu_label.lower() or "ryzen 9" in self.cpu_label.lower():
+        cpu_text = self.cpu_label.lower()
+        if any(token in cpu_text for token in ["i7", "i9", "ryzen 7", "ryzen 9"]):
             cpu_factor = 1.2
         return ram_factor * 0.45 + storage_factor * 0.15 + cpu_factor * 0.40
 
-
-# ================================================================
-# מאגר ידע
-# ================================================================
 
 @dataclass
 class KnowledgeUnit:
@@ -233,10 +240,6 @@ class KnowledgeBase:
         return dict(out)
 
 
-# ================================================================
-# פרופיל כישורים
-# ================================================================
-
 @dataclass
 class SkillProfile:
     skills: Dict[str, float] = field(default_factory=lambda: {
@@ -280,10 +283,6 @@ class SkillProfile:
         scored.sort(key=lambda x: x[1], reverse=True)
         return scored[:top_k]
 
-
-# ================================================================
-# קוגניציה – לא מוגבלת בתקרה אנושית
-# ================================================================
 
 @dataclass
 class CognitiveCore:
@@ -350,10 +349,6 @@ class CognitiveCore:
         ) * max(0.01, hardware_factor)
 
 
-# ================================================================
-# גיל – אופציונלי בלבד
-# ================================================================
-
 @dataclass
 class AgingSystem:
     chronological_steps: int = 0
@@ -367,10 +362,6 @@ class AgingSystem:
         if self.biology_enabled:
             self.biological_age += step_size_days / 365.0
 
-
-# ================================================================
-# רגשות / צרכים
-# ================================================================
 
 @dataclass
 class EmotionalState:
@@ -404,10 +395,6 @@ class NeedsState:
         return self.needs.get(name, 0.5)
 
 
-# ================================================================
-# זיכרונות
-# ================================================================
-
 @dataclass
 class Memory:
     summary: str
@@ -417,10 +404,6 @@ class Memory:
     value: float = 0.0
     related_question: str = ""
 
-
-# ================================================================
-# שאלות משתמשים ותוכנית מחקר
-# ================================================================
 
 @dataclass
 class UserQuestion:
@@ -449,6 +432,14 @@ class ResearchPlan:
     targets: List[ResearchTarget] = field(default_factory=list)
     money_goal: float = 0.0
     improvement_domains: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SearchResult:
+    title: str
+    url: str
+    snippet: str = ""
+    source_label: str = ""
 
 
 @dataclass
@@ -516,52 +507,171 @@ class ResearchPlanner:
 
         base_domain = uq.target_domain if uq.target_domain != "general" else "business_strategy"
 
-        plan.targets.append(ResearchTarget(
-            topic=f"What is {base_domain}",
-            domain=base_domain,
-            purpose="foundation",
-            priority=0.95,
-        ))
-        plan.targets.append(ResearchTarget(
-            topic=f"legal ways to earn money online using {base_domain}",
-            domain=base_domain,
-            purpose="income_paths",
-            priority=1.00,
-        ))
-        plan.targets.append(ResearchTarget(
-            topic=f"skills required to make money with {base_domain}",
-            domain=base_domain,
-            purpose="skill_map",
-            priority=0.92,
-        ))
-        plan.targets.append(ResearchTarget(
-            topic=f"best services products or offers related to {base_domain}",
-            domain=base_domain,
-            purpose="offer_design",
-            priority=0.88,
-        ))
-        plan.targets.append(ResearchTarget(
-            topic=f"legal and compliance considerations in {base_domain}",
-            domain="compliance",
-            purpose="compliance",
-            priority=0.94,
-        ))
+        plan.targets.extend([
+            ResearchTarget(topic=f"What is {base_domain}", domain=base_domain, purpose="foundation", priority=0.95),
+            ResearchTarget(topic=f"legal ways to earn money online using {base_domain}", domain=base_domain, purpose="income_paths", priority=1.00),
+            ResearchTarget(topic=f"skills required to make money with {base_domain}", domain=base_domain, purpose="skill_map", priority=0.92),
+            ResearchTarget(topic=f"best services products or offers related to {base_domain}", domain=base_domain, purpose="offer_design", priority=0.88),
+            ResearchTarget(topic=f"legal and compliance considerations in {base_domain}", domain="compliance", purpose="compliance", priority=0.94),
+        ])
 
         improvement_domains = [base_domain, "research", "market_research", "business_strategy", "sales", "copywriting"]
-        if base_domain in {"crypto"}:
+        if base_domain == "crypto":
             improvement_domains.extend(["compliance", "documentation", "python", "sql"])
         elif base_domain in {"php", "python", "sql"}:
             improvement_domains.extend(["client_communication", "offer_design", "automation"])
-        elif base_domain in {"seo"}:
+        elif base_domain == "seo":
             improvement_domains.extend(["copywriting", "market_research", "sales"])
 
         plan.improvement_domains = sorted(set(improvement_domains))
         return plan
 
 
-# ================================================================
-# הזדמנויות הכנסה
-# ================================================================
+class SearchProviderBase:
+    # Author: pablo rotem
+    def search(self, query: str, max_results: int = 5) -> List[SearchResult]:
+        raise NotImplementedError
+
+
+class SearxNGSearchProvider(SearchProviderBase):
+    # Author: pablo rotem
+    def __init__(self, base_url: str, timeout: int = 20) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.timeout = timeout
+
+    def search(self, query: str, max_results: int = 5) -> List[SearchResult]:
+        params = {"q": query, "format": "json", "language": "en"}
+        response = requests.get(f"{self.base_url}/search", params=params, timeout=self.timeout)
+        response.raise_for_status()
+        data = response.json()
+        out: List[SearchResult] = []
+        for item in data.get("results", [])[:max_results]:
+            out.append(SearchResult(
+                title=str(item.get("title", "")).strip(),
+                url=str(item.get("url", "")).strip(),
+                snippet=str(item.get("content", "")).strip(),
+                source_label=str(item.get("engine", "searxng")).strip(),
+            ))
+        return out
+
+
+class StaticSearchProvider(SearchProviderBase):
+    # Author: pablo rotem
+    def __init__(self, mapping: Dict[str, List[SearchResult]]) -> None:
+        self.mapping = mapping
+
+    def search(self, query: str, max_results: int = 5) -> List[SearchResult]:
+        return self.mapping.get(query, [])[:max_results]
+
+
+@dataclass
+class BrowserConfig:
+    headless: bool = True
+    timeout_ms: int = 25000
+    user_agent: str = "PabloResearchBot/1.0 (+legal-respectful-research)"
+    max_content_chars: int = 30000
+    respect_robots_txt: bool = True
+
+
+class LiveBrowserResearchAdapter:
+    # Author: pablo rotem
+    def __init__(self, config: Optional[BrowserConfig] = None) -> None:
+        self.config = config or BrowserConfig()
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": self.config.user_agent})
+
+    def _robots_allowed(self, url: str) -> bool:
+        if not self.config.respect_robots_txt:
+            return True
+        parsed = urllib.parse.urlparse(url)
+        robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
+        rp = urllib.robotparser.RobotFileParser()
+        try:
+            rp.set_url(robots_url)
+            rp.read()
+            return rp.can_fetch(self.config.user_agent, url)
+        except Exception:
+            return True
+
+    def fetch_html(self, url: str) -> str:
+        if self.config.respect_robots_txt and not self._robots_allowed(url):
+            raise PermissionError(f"robots.txt disallows fetch: {url}")
+
+        if sync_playwright is not None:
+            try:
+                with sync_playwright() as pw:
+                    browser = pw.chromium.launch(headless=self.config.headless)
+                    page = browser.new_page(user_agent=self.config.user_agent)
+                    page.goto(url, wait_until="networkidle", timeout=self.config.timeout_ms)
+                    html = page.content()
+                    browser.close()
+                    return html
+            except Exception:
+                pass
+
+        response = self.session.get(url, timeout=self.config.timeout_ms / 1000)
+        response.raise_for_status()
+        return response.text
+
+    def extract_main_text(self, html: str, url: str = "") -> str:
+        if trafilatura is not None:
+            try:
+                text = trafilatura.extract(html, url=url, favor_precision=True, include_comments=False)
+                if text:
+                    return normalize_space(text)[: self.config.max_content_chars]
+            except Exception:
+                pass
+
+        if BeautifulSoup is not None:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            return normalize_space(soup.get_text(" ", strip=True))[: self.config.max_content_chars]
+
+        return normalize_space(html)[: self.config.max_content_chars]
+
+    def browse_url(self, url: str, domain: str, query: str, source_label: str = "web") -> Optional[SearchEvidence]:
+        try:
+            html = self.fetch_html(url)
+            text = self.extract_main_text(html, url=url)
+            if not text:
+                return None
+            title = url
+            if BeautifulSoup is not None:
+                try:
+                    soup = BeautifulSoup(html, "html.parser")
+                    title_tag = soup.find("title")
+                    if title_tag and title_tag.text.strip():
+                        title = normalize_space(title_tag.text)
+                except Exception:
+                    pass
+            return SearchEvidence(
+                query=query,
+                title=title,
+                summary=first_sentences(text, max_chars=700),
+                source_label=source_label,
+                source_url=url,
+                domain=domain,
+                reliability=0.70,
+                legal_score=1.0,
+                monetization_score=0.40 if any(tok in text.lower() for tok in ["service", "client", "pricing", "automation", "seo", "tool", "consulting"]) else 0.18,
+                tags=["live_browser", "web_research"],
+            )
+        except Exception:
+            return None
+
+    def research_query(self, query: str, domain: str, search_provider: SearchProviderBase, max_results: int = 5) -> List[SearchEvidence]:
+        evidence_list: List[SearchEvidence] = []
+        results = search_provider.search(query, max_results=max_results)
+        for result in results:
+            ev = self.browse_url(result.url, domain=domain, query=query, source_label=result.source_label or "web")
+            if ev is not None:
+                ev.title = result.title or ev.title
+                if result.snippet:
+                    ev.summary = first_sentences(f"{result.snippet} {ev.summary}", max_chars=700)
+                evidence_list.append(ev)
+        return evidence_list
+
 
 @dataclass
 class IncomeOpportunity:
@@ -678,10 +788,6 @@ class OpportunityCatalog:
         return ranked
 
 
-# ================================================================
-# Ingest לקבצים
-# ================================================================
-
 @dataclass
 class IngestResult:
     path: str
@@ -690,6 +796,7 @@ class IngestResult:
 
 
 class FileIngester:
+    # Author: pablo rotem
     def __init__(self, knowledge: KnowledgeBase, step_getter) -> None:
         self.knowledge = knowledge
         self.step_getter = step_getter
@@ -809,10 +916,6 @@ class FileIngester:
         return result
 
 
-# ================================================================
-# Payouts – בקשה / אישור / יצוא בלבד
-# ================================================================
-
 @dataclass
 class PayoutRequest:
     request_id: str
@@ -875,10 +978,6 @@ class PayoutManager:
             "ביצוע payout אוטומטי ל-PayPal אינו ממומש כאן. יש להשתמש בבקשת payout + אישור ידני + ביצוע ידני במערכת התשלומים."
         )
 
-
-# ================================================================
-# מנוע שיפור עצמי
-# ================================================================
 
 @dataclass
 class ImprovementTask:
@@ -971,11 +1070,8 @@ class SelfImprovementEngine:
             skills.improve(task.skill, delta)
 
 
-# ================================================================
-# מחקר מבוסס שאלות משתמש
-# ================================================================
-
 class EvidenceIngestor:
+    # Author: pablo rotem
     def __init__(self, knowledge: KnowledgeBase, step_getter) -> None:
         self.knowledge = knowledge
         self.step_getter = step_getter
@@ -994,10 +1090,6 @@ class EvidenceIngestor:
             metadata={"source_url": evidence.source_url, "query": evidence.query},
         )
 
-
-# ================================================================
-# המודל הראשי
-# ================================================================
 
 @dataclass
 class HumanEngineModel:
@@ -1035,9 +1127,6 @@ class HumanEngineModel:
     def hardware_factor(self) -> float:
         return self.hardware.hardware_factor()
 
-    # ------------------------------------------------------------
-    # למידה רגילה
-    # ------------------------------------------------------------
     def learn(
         self,
         domain: str,
@@ -1070,9 +1159,7 @@ class HumanEngineModel:
         items = self.knowledge.retrieve(query, current_step=self.aging.chronological_steps, top_k=8)
         if not items:
             return f"לא נמצא ידע מספיק עבור: {query}"
-        lines = []
-        for item in items:
-            lines.append(f"[{item.domain}] {item.concept} | חוזק={round(item.strength, 2)} | ודאות={round(item.confidence, 2)}")
+        lines = [f"[{item.domain}] {item.concept} | חוזק={round(item.strength, 2)} | ודאות={round(item.confidence, 2)}" for item in items]
         self.learn(
             domain=domain,
             concept=f"Synthesis::{query}",
@@ -1083,12 +1170,8 @@ class HumanEngineModel:
             monetization_score=0.35,
             tags=["synthesis", "internal_learning"],
         )
-        return "
-".join(lines)
+        return "\n".join(lines)
 
-    # ------------------------------------------------------------
-    # שאלות משתמש → תוכנית מחקר → למידה
-    # ------------------------------------------------------------
     def analyze_user_question(self, question_text: str) -> UserQuestion:
         return self.intent_analyzer.analyze(question_text)
 
@@ -1105,7 +1188,6 @@ class HumanEngineModel:
         self.emotions.add("מיקוד", 0.06)
         self.emotions.add("תקווה", uq.money_relevance * 0.05)
 
-        # עצם השאלה היא אות למידה
         self.learn(
             domain=uq.target_domain,
             concept=f"UserQuestion::{uq.text}",
@@ -1124,13 +1206,11 @@ class HumanEngineModel:
                 if evidence.legal_score < 0.5:
                     continue
                 self.evidence_ingestor.absorb(evidence)
-                # חיזוק כישורים לפי תחום המחקר
                 self.skills.improve(evidence.domain, 0.25 + evidence.reliability * 0.20)
                 self.skills.improve("research", 0.10 + evidence.reliability * 0.10)
                 absorbed += 1
                 self.total_learning_events += 1
 
-        # משפר כישורים לפי התוכנית
         tasks = self.improver.plan_skill_growth(self.skills, target_domains=plan.improvement_domains)
         self.improver.apply_skill_growth(self.skills, tasks[:6], self.cognition)
         self.improver.improve_core(self.cognition, self.knowledge_index(), self.total_user_questions)
@@ -1155,39 +1235,60 @@ class HumanEngineModel:
             "top_skills": self.skills.top_skills(10),
         }
 
+    def learn_from_user_question_live(
+        self,
+        question_text: str,
+        search_provider: SearchProviderBase,
+        browser: Optional[LiveBrowserResearchAdapter] = None,
+        max_results_per_target: int = 4,
+    ) -> Dict[str, Any]:
+        browser = browser or LiveBrowserResearchAdapter()
+        uq = self.analyze_user_question(question_text)
+        plan = self.research_planner.build(uq)
+
+        all_evidence: List[SearchEvidence] = []
+        for target in sorted(plan.targets, key=lambda x: x.priority, reverse=True):
+            all_evidence.extend(
+                browser.research_query(
+                    query=target.topic,
+                    domain=target.domain,
+                    search_provider=search_provider,
+                    max_results=max_results_per_target,
+                )
+            )
+
+        result = self.learn_from_user_question(question_text=question_text, evidence_list=all_evidence)
+        result["live_research_evidence"] = [asdict(ev) for ev in all_evidence]
+        result["live_research_count"] = len(all_evidence)
+        return result
+
     def infer_legal_income_paths_from_question(self, question_text: str) -> List[str]:
         plan = self.build_research_plan_for_question(question_text)
         domain = plan.domain
-        paths: List[str] = []
         if domain == "crypto":
-            paths.extend([
+            return [
                 "כתיבת תוכן / מחקר / השוואות בתחום הקריפטו באופן חוקי",
                 "בניית כלי אנליטיקה / דשבורדים / סקריפטים חוקיים לחברות או ללקוחות",
                 "תיעוד, technical writing, ויצירת מדריכים",
                 "שירותי פיתוח לאתרים, כלים, APIs או אוטומציות בחברות קריפטו חוקיות",
                 "מחקר שוק, SEO, ועמודי תוכן בעלי כוונת רכישה",
-            ])
-        elif domain in {"php", "python", "sql"}:
-            paths.extend([
+            ]
+        if domain in {"php", "python", "sql"}:
+            return [
                 "עבודות פיתוח ללקוחות",
                 "שירותים ארוזים",
                 "מוצרים דיגיטליים קטנים",
                 "אוטומציות וכלי עבודה",
                 "דוחות, ניתוחים ומיגרציות",
-            ])
-        else:
-            paths.extend([
-                "שירותי ייעוץ / ביצוע אונליין",
-                "תוכן, SEO וכתיבה",
-                "מוצרים קטנים / תבניות / כלים",
-                "שירותים ארוזים עם תהליך קבוע",
-                "מחקר שוק וניתוח מתחרים",
-            ])
-        return paths
+            ]
+        return [
+            "שירותי ייעוץ / ביצוע אונליין",
+            "תוכן, SEO וכתיבה",
+            "מוצרים קטנים / תבניות / כלים",
+            "שירותים ארוזים עם תהליך קבוע",
+            "מחקר שוק וניתוח מתחרים",
+        ]
 
-    # ------------------------------------------------------------
-    # מדדים
-    # ------------------------------------------------------------
     def knowledge_index(self) -> float:
         return self.knowledge.total_strength()
 
@@ -1195,30 +1296,18 @@ class HumanEngineModel:
         return self.cognition.iq_like_index(hardware_factor=self.hardware_factor())
 
     def problem_solving_index(self) -> float:
-        return self.cognition.problem_solving_index(
-            knowledge_factor=self.knowledge_index(),
-            hardware_factor=self.hardware_factor(),
-        )
+        return self.cognition.problem_solving_index(self.knowledge_index(), self.hardware_factor())
 
     def judgment_index(self) -> float:
-        return self.cognition.judgment_index(hardware_factor=self.hardware_factor())
+        return self.cognition.judgment_index(self.hardware_factor())
 
-    # ------------------------------------------------------------
-    # הזדמנויות הכנסה
-    # ------------------------------------------------------------
     def best_income_opportunities(self, top_k: int = 5) -> List[Tuple[IncomeOpportunity, float]]:
         return self.catalog.rank(self.skills)[:top_k]
 
     def discover_more_income_ways(self) -> List[str]:
         ranked = self.best_income_opportunities(top_k=8)
-        ideas = []
-        for opp, score in ranked:
-            ideas.append(f"{opp.name} | score={round(score, 3)} | category={opp.category}")
-        return ideas
+        return [f"{opp.name} | score={round(score, 3)} | category={opp.category}" for opp, score in ranked]
 
-    # ------------------------------------------------------------
-    # פעולות
-    # ------------------------------------------------------------
     def allowed_actions(self) -> List[str]:
         return [
             "study_user_question",
@@ -1252,7 +1341,6 @@ class HumanEngineModel:
         score += self.needs.get("מחקר") * 0.08
         score += self.skills.get(domain) * 0.002
         score += self.cognition.monetization_intelligence * 0.06
-
         if action_name == "study_user_question":
             score += self.cognition.query_decomposition * 0.07 + self.cognition.research_quality * 0.05
         elif action_name == "research_topic":
@@ -1267,7 +1355,6 @@ class HumanEngineModel:
             score += self.skills.get("offer_design") * 0.003 + self.skills.get("business_strategy") * 0.003
         elif action_name == "discover_new_income_track":
             score += self.skills.get("market_research") * 0.003
-
         score += self.rng.uniform(-0.02, 0.02)
         return score
 
@@ -1278,7 +1365,7 @@ class HumanEngineModel:
             ok, _ = self.safety.validate_action(action_name, tags=tags)
             if not ok:
                 continue
-            scores[action_name] = self.score_action(action_name, domain=domain, income_value=income_value, usefulness_value=usefulness_value)
+            scores[action_name] = self.score_action(action_name, domain, income_value, usefulness_value)
         if not scores:
             return "plan_long_term", {"plan_long_term": 0.0}
         best = max(scores, key=scores.get)
@@ -1309,7 +1396,6 @@ class HumanEngineModel:
             income_signal *= 0.52
         elif action_name in {"study_user_question", "research_topic"}:
             income_signal *= 0.30
-
         income_signal *= self.rng.uniform(0.72, 1.28)
         return max(0.0, income_signal)
 
@@ -1347,7 +1433,7 @@ class HumanEngineModel:
             improve_skill=True,
         )
 
-        income_generated = self.simulate_income(action_name=action, domain=domain, base_income_value=income_value)
+        income_generated = self.simulate_income(action, domain, income_value)
         self.total_income_usd_simulated += income_generated
         self.total_actions += 1
         self.aging.advance(step_size_days=1.0)
@@ -1360,11 +1446,7 @@ class HumanEngineModel:
             value=income_generated,
         ))
 
-        self.improver.improve_core(
-            cognition=self.cognition,
-            knowledge_total=self.knowledge_index(),
-            query_count=self.total_user_questions,
-        )
+        self.improver.improve_core(self.cognition, self.knowledge_index(), self.total_user_questions)
 
         return {
             "description": description,
@@ -1382,9 +1464,6 @@ class HumanEngineModel:
             "top_skills": self.skills.top_skills(8),
         }
 
-    # ------------------------------------------------------------
-    # שיפור ייעודי לפי תחומים שמביאים כסף
-    # ------------------------------------------------------------
     def improve_coding_for_income(self, cycles: int = 100) -> None:
         domains = [
             ("php", "advanced PHP for client work", 1.10, 0.95),
@@ -1451,15 +1530,9 @@ class HumanEngineModel:
             self.improver.apply_skill_growth(self.skills, tasks[:6], self.cognition)
             self.improver.improve_core(self.cognition, self.knowledge_index(), self.total_user_questions)
 
-    # ------------------------------------------------------------
-    # Ingest
-    # ------------------------------------------------------------
     def get_ingester(self) -> FileIngester:
         return FileIngester(self.knowledge, step_getter=lambda: self.aging.chronological_steps)
 
-    # ------------------------------------------------------------
-    # Payouts – בקשה ואישור בלבד
-    # ------------------------------------------------------------
     def maybe_create_payout_request(self, threshold_usd: float = 500.0, reason: str = "Periodic payout request") -> Optional[PayoutRequest]:
         if self.total_income_usd_simulated >= threshold_usd:
             return self.payout_manager.create_payout_request(
@@ -1469,9 +1542,6 @@ class HumanEngineModel:
             )
         return None
 
-    # ------------------------------------------------------------
-    # מצב
-    # ------------------------------------------------------------
     def snapshot(self) -> Dict[str, Any]:
         return {
             "name": self.name,
@@ -1506,37 +1576,41 @@ class HumanEngineModel:
             json.dump(self.snapshot(), f, ensure_ascii=False, indent=2)
 
 
-# ================================================================
-# בניית מנוע דמו
-# ================================================================
-
 def build_demo_engine() -> HumanEngineModel:
     engine = HumanEngineModel(rng_seed=42)
     engine.aging.biology_enabled = False
     engine.aging.biological_age = 0.0
-
-    # בסיס ידע ראשוני
     engine.learn("php", "php 8.3 practical client coding", amount=9.0, confidence=0.85, source="bootstrap", usefulness=0.88, monetization_score=0.90, tags=["coding"])
     engine.learn("python", "python automation and backend work", amount=9.5, confidence=0.86, source="bootstrap", usefulness=0.92, monetization_score=0.94, tags=["coding"])
     engine.learn("sql", "sql migrations and reporting", amount=8.0, confidence=0.83, source="bootstrap", usefulness=0.86, monetization_score=0.88, tags=["coding"])
     engine.learn("wordpress", "wordpress custom themes and plugins", amount=8.8, confidence=0.84, source="bootstrap", usefulness=0.90, monetization_score=0.90, tags=["client_work"])
     engine.learn("seo", "intent driven SEO systems", amount=7.0, confidence=0.80, source="bootstrap", usefulness=0.84, monetization_score=0.86, tags=["content"])
     engine.learn("sales", "ethical trust based sales", amount=6.8, confidence=0.78, source="bootstrap", usefulness=0.82, monetization_score=0.90, tags=["income"])
-
     return engine
 
 
-# ================================================================
-# דוגמת קריפטו – מחקר מבוסס שאלה
-# ================================================================
+def run_demo() -> None:
+    engine = build_demo_engine()
+    print("\n--- התקנה מומלצת למחקר חי ---")
+    print("pip install playwright trafilatura beautifulsoup4 requests")
+    print("python -m playwright install chromium")
 
-def build_demo_crypto_evidence() -> List[SearchEvidence]:
-    return [
+    question = "How to get rich using cryptocurrencies legally online?"
+    plan = engine.build_research_plan_for_question(question)
+    print("\n--- תוכנית מחקר ---")
+    print(json.dumps([asdict(t) for t in plan.targets], ensure_ascii=False, indent=2))
+
+    # שימוש חי לדוגמה:
+    # provider = SearxNGSearchProvider(base_url="https://your-searxng-instance.example")
+    # browser = LiveBrowserResearchAdapter(BrowserConfig(headless=True, respect_robots_txt=True))
+    # result = engine.learn_from_user_question_live(question, provider, browser, max_results_per_target=3)
+
+    result = engine.learn_from_user_question(question_text=question, evidence_list=[
         SearchEvidence(
-            query="what is cryptocurrency",
-            title="Cryptocurrency basics",
+            query="What is crypto",
+            title="Crypto basics",
             summary="Digital assets, wallets, blockchains, exchanges, and on-chain transactions.",
-            source_label="official_docs_or_reputable_site",
+            source_label="demo",
             source_url="",
             domain="crypto",
             reliability=0.86,
@@ -1545,10 +1619,10 @@ def build_demo_crypto_evidence() -> List[SearchEvidence]:
             tags=["crypto", "foundation"],
         ),
         SearchEvidence(
-            query="legal ways to earn money online with cryptocurrency",
+            query="legal ways to earn money online using crypto",
             title="Legal crypto income paths",
             summary="Research, education, content, analytics, tooling, compliance documentation, and software services.",
-            source_label="reputable_research_site",
+            source_label="demo",
             source_url="",
             domain="crypto",
             reliability=0.82,
@@ -1557,10 +1631,10 @@ def build_demo_crypto_evidence() -> List[SearchEvidence]:
             tags=["crypto", "income", "legal"],
         ),
         SearchEvidence(
-            query="crypto compliance basics",
+            query="legal and compliance considerations in crypto",
             title="Compliance and regulatory awareness",
             summary="KYC, AML, tax reporting, licensing boundaries, and user disclosures matter.",
-            source_label="official_or_legal_source",
+            source_label="demo",
             source_url="",
             domain="compliance",
             reliability=0.90,
@@ -1568,99 +1642,15 @@ def build_demo_crypto_evidence() -> List[SearchEvidence]:
             monetization_score=0.35,
             tags=["crypto", "compliance", "legal"],
         ),
-        SearchEvidence(
-            query="best skills for crypto tooling",
-            title="Skills for crypto-related tooling",
-            summary="Python, data handling, APIs, documentation, dashboards, analytics, and security awareness.",
-            source_label="technical_source",
-            source_url="",
-            domain="python",
-            reliability=0.80,
-            legal_score=1.0,
-            monetization_score=0.54,
-            tags=["crypto", "python", "tooling"],
-        ),
-    ]
+    ])
 
-
-# ================================================================
-# הדגמה
-# ================================================================
-
-def run_demo() -> None:
-    engine = build_demo_engine()
-
-    question = "How to get rich using cryptocurrencies legally online?"
-    evidence = build_demo_crypto_evidence()
-    learning_result = engine.learn_from_user_question(question_text=question, evidence_list=evidence)
-
-    print("
---- למידה משאלת משתמש ---")
-    print(json.dumps(learning_result, ensure_ascii=False, indent=2))
-
-    print("
---- מסלולי הכנסה חוקיים שנלמדו מהשאלה ---")
+    print("\n--- למידה משאלת משתמש ---")
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    print("\n--- מסלולי הכנסה חוקיים שנלמדו מהשאלה ---")
     print(json.dumps(engine.infer_legal_income_paths_from_question(question), ensure_ascii=False, indent=2))
 
-    work_cycles = [
-        {
-            "description": "build a python dashboard for crypto market analytics",
-            "domain": "python",
-            "tags": ["crypto", "analytics", "tooling", "legal"],
-            "learning_value": 0.88,
-            "income_value": 0.82,
-            "usefulness_value": 0.90,
-        },
-        {
-            "description": "write legal educational crypto content for a client",
-            "domain": "copywriting",
-            "tags": ["crypto", "content", "education", "legal"],
-            "learning_value": 0.72,
-            "income_value": 0.68,
-            "usefulness_value": 0.84,
-        },
-        {
-            "description": "offer compliance-aware research service for crypto startups",
-            "domain": "compliance",
-            "tags": ["crypto", "research", "compliance", "legal"],
-            "learning_value": 0.74,
-            "income_value": 0.76,
-            "usefulness_value": 0.86,
-        },
-    ]
-
-    for idx, cycle in enumerate(work_cycles, start=1):
-        result = engine.process_work_cycle(**cycle)
-        print(f"
---- מחזור עבודה {idx} ---")
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-
-    # לולאות שיפור מכוונות לשאלה
-    plan = engine.build_research_plan_for_question(question)
-    engine.improve_coding_for_income(cycles=50)
-    engine.improve_money_system(cycles=50)
-    engine.recursive_self_improvement(cycles=70, target_domains=plan.improvement_domains)
-
-    # בקשת payout לדוגמה – רק בקשה + אישור + יצוא
-    payout = engine.maybe_create_payout_request(threshold_usd=500.0, reason="Manual payout request after simulated earnings threshold")
-    if payout:
-        print("
---- נוצרה בקשת payout ---")
-        print(json.dumps(asdict(payout), ensure_ascii=False, indent=2))
-        approved = engine.payout_manager.approve_request(payout.request_id, approved_by="pablo rotem", current_step=engine.aging.chronological_steps)
-        print("
---- אושרה ידנית ---")
-        print(json.dumps(asdict(approved), ensure_ascii=False, indent=2))
-        exported_count = engine.payout_manager.export_approved_to_csv("approved_payouts.csv")
-        print(f"
-יוצאו {exported_count} בקשות payout מאושרות לקובץ approved_payouts.csv")
-
-    engine.save_json("human_engine_query_driven_snapshot.json")
-    print("
---- מצב סופי ---")
-    print(json.dumps(engine.snapshot(), ensure_ascii=False, indent=2))
-    print("
-נשמר קובץ: human_engine_query_driven_snapshot.json")
+    engine.save_json("human_engine_live_browser_snapshot.json")
+    print("\nנשמר קובץ: human_engine_live_browser_snapshot.json")
 
 
 if __name__ == "__main__":
